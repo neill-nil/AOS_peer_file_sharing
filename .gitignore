@@ -1,0 +1,7 @@
+.vscode/
+tracker/tracker_app
+client/client_app
+client/downloaded.txt
+client/src/download_manager.o
+client/src/hash_utils.o
+client/src/main.o
