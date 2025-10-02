@@ -13,7 +13,7 @@
 
 using namespace std;
 
-static string global_current_user;
+// static string global_current_user;
 
 static string trim(const string &s) {
     size_t a = 0, b = s.size();
@@ -32,19 +32,19 @@ string handle_command(const string& command, string& current_user) {
         iss >> username >> password;
         return create_user(username, password);
     } 
+    else if (cmd == "login") {
+        string username, password, peer_addr;
+        iss >> username >> password >> peer_addr;
+        return login_user(username, password, current_user, peer_addr);
+    }
+    else if (cmd == "logout") {
+        return logout_user(current_user); // this should also clear current_user
+    }
     else if (cmd == "create_group") {
         string group_id;
         iss >> group_id;
         return create_group(group_id, current_user);
-    } 
-    else if (cmd == "login") {
-        string username, password;
-        iss >> username >> password;
-        return login_user(username, password, current_user);
-    } 
-    else if (cmd == "logout") {
-        return logout_user(current_user);
-    } 
+    }
     else if (cmd == "join_group") {
         string group_id;
         iss >> group_id;
@@ -57,6 +57,12 @@ string handle_command(const string& command, string& current_user) {
     }
     else if (cmd == "list_groups") {
         return list_groups();
+    }
+    else if (cmd == "get_file_info") {
+        string group_id, file_name;
+        cout<<"---------------------";
+        iss >> group_id >> file_name;
+        return get_file_info(group_id, file_name, current_user);
     }
     else if (cmd == "list_requests") {
         string group_id;
@@ -74,9 +80,16 @@ string handle_command(const string& command, string& current_user) {
         return accept_request(group_id, user, current_user);
     }
     else if (cmd == "upload_file") {
-        string group_id, file_name;
+        string group_id, file_path;
         long long file_size;
-        iss >> group_id >> file_name >> file_size;
+        iss >> group_id >> file_path >> file_size;
+
+        // strip directory, keep only basename
+        string file_name = file_path;
+        size_t pos = file_path.find_last_of("/\\");
+        if (pos != string::npos) {
+            file_name = file_path.substr(pos + 1);
+        }
 
         vector<string> piece_hashes;
         string hash;
@@ -100,6 +113,7 @@ string handle_command(const string& command, string& current_user) {
 
 
 void handle_peer_request(int client_socket) {
+    string current_user;
     char buffer[4096];
     while (true) {
         ssize_t valread = recv(client_socket, buffer, sizeof(buffer) - 1, 0);
@@ -115,18 +129,27 @@ void handle_peer_request(int client_socket) {
             break;
         }
 
-        string response = handle_command(command, global_current_user);
+        string response = handle_command(command, current_user);
         if (response.empty()) response = "\n";
         if (response.back() != '\n') response.push_back('\n');
-        send(client_socket, response.c_str(), response.size(), 0);
+        send_all(client_socket, response.c_str(), response.size());
 
         if (response.find("Logout successful") != string::npos) {
-            global_current_user.clear();
+            current_user.clear();
         }
+    }
+    if (!current_user.empty()) {
+        if (logged_in.find(current_user) != logged_in.end()) {
+            logged_in[current_user] = false;
+        }
+        sync_write("LOGOUT " + current_user);
+        cout << "⚠️ Auto-logged out user " << current_user << " due to client disconnect\n";
+        current_user.clear();
     }
 
     close(client_socket);
 }
+//
 
 
 void tracker_loop(int server_fd, bool &running) {

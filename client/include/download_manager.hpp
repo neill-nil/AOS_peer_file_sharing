@@ -1,3 +1,4 @@
+// download_manager.hpp
 #pragma once
 #include <string>
 #include <vector>
@@ -20,6 +21,9 @@ struct DownloadState {
     int pieces_done = 0;                    // how many pieces completed
     int in_progress = 0;                    // how many pieces currently being downloaded
     bool completed = false;
+
+    // cancellation flag: set by stop_download() so workers can exit cleanly
+    bool cancelled = false;
 };
 
 extern std::map<std::string, DownloadState> downloads; // key: "<group>:<file>"

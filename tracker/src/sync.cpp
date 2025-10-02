@@ -27,13 +27,15 @@ void sync_write(const string& entry) {
 }
 
 void replay_sync_file() {
-    lseek(sync_fd, 0, SEEK_SET);
+    static off_t last_offset = 0;
+    lseek(sync_fd, last_offset, SEEK_SET);
     char buffer[4096];
     string content;
 
     ssize_t bytes;
     while ((bytes = read(sync_fd, buffer, sizeof(buffer))) > 0) {
         content.append(buffer, bytes);
+        last_offset += bytes;  
     }
 
     istringstream iss(content);

@@ -6,14 +6,15 @@
 using namespace std;
 
 unordered_map<string, bool> logged_in;
-unordered_map<string, string> users;
-unordered_map<string, string> groups;
-unordered_map<string, unordered_set<string>> group_members;
-unordered_map<string, unordered_set<string>> join_requests;
+unordered_map<string, string> users; // username -> password
+unordered_map<string, string> groups; // group_id -> owner
+unordered_map<string, unordered_set<string>> group_members; // group_id -> members
+unordered_map<string, unordered_set<string>> join_requests; // group_id -> pending requests
+unordered_map<string, string> user_peer_addresses; // username -> ip:port
 
 
 // USERS
-string create_user(string& username, string& password) {
+string create_user(const string& username, const string& password) {
     if (users.find(username) != users.end()) {
         return "ERROR: User already exists\n";
     }
@@ -23,28 +24,49 @@ string create_user(string& username, string& password) {
     return "User created successfully\n";
 }
 
-string login_user(string& username, string& password, string& current_user) {
+string login_user(const string& username, const string& password, string& current_user, const string& peer_addr) {
+    // Prevent double login on same client session
+    cout << "[DEBUG] login_user: before -> current_user='" << current_user << "'" << endl;
+    if (!current_user.empty()) {
+        return "ERROR: Already logged in as " + current_user + " (logout first)\n";
+    }
+
     auto it = users.find(username);
     if (it == users.end() || it->second != password) {
         return "ERROR: Invalid credentials\n";
     }
+    if (logged_in[username]) {
+        return "ERROR: User already logged in elsewhere\n";
+    }
+
     logged_in[username] = true;
+    user_peer_addresses[username] = peer_addr;
     current_user = username;
+    cout << "[DEBUG] login_user: before -> current_user='" << current_user << "'" << endl;
     sync_write("LOGIN " + username);
-    return "Login successful\n";
+
+    return "Login successful as " + username + "\n";
 }
+
 
 string logout_user(string& current_user) {
-    if (current_user.empty()) return "ERROR: No user logged in\n";
+    if (current_user.empty()) {
+        return "ERROR: No user logged in\n";
+    }
+
+    // Always log them out in session and global state
     logged_in[current_user] = false;
     sync_write("LOGOUT " + current_user);
-    return "Logout successful\n";
-}
 
+    string old_user = current_user;
+    current_user.clear();
+
+    return "Logout successful (" + old_user + ")\n";
+}
 
 
 // GROUPS
-string create_group(string& group_id, string& current_user) {
+string create_group(const string& group_id, string& current_user) {
     if (current_user.empty() || !logged_in[current_user]) {
         return "ERROR: Must be logged in to create group\n";
     }
@@ -52,12 +74,13 @@ string create_group(string& group_id, string& current_user) {
         return "ERROR: Group already exists\n";
     }
     groups[group_id] = current_user;
+    group_members[group_id].clear();
     group_members[group_id].insert(current_user);
     sync_write("CREATE_GROUP " + group_id + " " + current_user);
     return "Group created successfully\n";
 }
 
-string join_group(string& group_id, string& current_user) {
+string join_group(const string& group_id, string& current_user) {
     if (current_user.empty() || !logged_in[current_user]) {
         return "ERROR: Must be logged in to join a group\n";
     }
@@ -79,8 +102,7 @@ string join_group(string& group_id, string& current_user) {
     return "Join request sent\n";
 }
 
-
-string leave_group(string& group_id, string& current_user) {
+string leave_group(const string& group_id, string& current_user) {
     if (current_user.empty() || !logged_in[current_user]) {
         return "ERROR: Must be logged in to leave a group\n";
     }
@@ -91,7 +113,9 @@ string leave_group(string& group_id, string& current_user) {
 
     // If owner leaves
     if (groups[group_id] == current_user) {
+        // remove owner from members first
         group_members[group_id].erase(current_user);
+
         if (group_members[group_id].empty()) {
             // no members left, delete group
             groups.erase(group_id);
@@ -100,21 +124,10 @@ string leave_group(string& group_id, string& current_user) {
             sync_write("DELETE_GROUP " + group_id);
             return "Group deleted as owner left\n";
         } else {
-            // pick a valid member as new owner
-            auto it = group_members[group_id].begin();
-            string new_owner;
-            while (it != group_members[group_id].end()) {
-                if (!it->empty() && *it != "JOIN_GROUP") { 
-                    new_owner = *it;
-                    break;
-                }
-                ++it;
-            }
-            if (new_owner.empty()) {
-                return "ERROR: Could not find valid new owner\n";
-            }
-
+            // reassign owner to first available member
+            string new_owner = *group_members[group_id].begin();
             groups[group_id] = new_owner;
+            // ensure new owner remains in members set (it is)
             sync_write("CHANGE_OWNER " + group_id + " " + new_owner);
             return "Owner left, new owner is " + new_owner + "\n";
         }
@@ -128,7 +141,6 @@ string leave_group(string& group_id, string& current_user) {
     return "ERROR: Not a member of group\n";
 }
 
-
 string list_groups() {
     string result = "Groups:\n";
     for (auto& g : groups) {
@@ -137,7 +149,7 @@ string list_groups() {
     return result;
 }
 
-string list_requests(string& group_id, string& current_user) {
+string list_requests(const string& group_id, string& current_user) {
     if (groups.find(group_id) == groups.end()) {
         return "ERROR: Group does not exist\n";
     }
@@ -151,7 +163,7 @@ string list_requests(string& group_id, string& current_user) {
     return result;
 }
 
-string accept_request(string& group_id, string& user, string& current_user) {
+string accept_request(const string& group_id, const string& user, string& current_user) {
     if (current_user.empty() || !logged_in[current_user]) {
         return "ERROR: Must be logged in to accept requests\n";
     }

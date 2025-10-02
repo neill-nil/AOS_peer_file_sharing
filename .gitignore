@@ -5,3 +5,6 @@ client/downloaded.txt
 client/src/download_manager.o
 client/src/hash_utils.o
 client/src/main.o
+/client/shared
+client/file2.txt
+tracker/sync.log

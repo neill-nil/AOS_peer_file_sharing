@@ -1,5 +1,5 @@
 #include "download_manager.hpp"
-#include "hash_utils.hpp"
+#include "hash_utils.hpp"   // provides sha1_hex(const char*, size_t) and helpers
 
 #include <iostream>
 #include <thread>
@@ -15,6 +15,7 @@
 #include <sys/socket.h>
 #include <cstring>
 #include <sstream>
+#include <vector>
 
 using namespace std;
 
@@ -28,12 +29,12 @@ static string make_key(const string& group, const string& file) {
     return group + ":" + file;
 }
 
+// safer write at offset for concurrent threads
 static bool write_piece_to_file(const string& path, int piece_idx, const vector<char>& data) {
-    int fd = open(path.c_str(), O_RDWR | O_CREAT, 0666);
+    int fd = open(path.c_str(), O_WRONLY | O_CREAT, 0666);
     if (fd < 0) return false;
     off_t offset = (off_t)piece_idx * (off_t)PIECE_SIZE;
-    if (lseek(fd, offset, SEEK_SET) < 0) { close(fd); return false; }
-    ssize_t w = write(fd, data.data(), data.size());
+    ssize_t w = pwrite(fd, data.data(), data.size(), offset);
     close(fd);
     return (w == (ssize_t)data.size());
 }
@@ -42,7 +43,11 @@ static bool parse_hostport(const string& hp, string& host, int& port) {
     size_t c = hp.find(':');
     if (c == string::npos) return false;
     host = hp.substr(0, c);
-    port = stoi(hp.substr(c + 1));
+    try {
+        port = stoi(hp.substr(c + 1));
+    } catch (...) {
+        return false;
+    }
     return true;
 }
 
@@ -62,13 +67,18 @@ static bool fetch_piece_from_peer(const string& peer_hp,
     addr.sin_port = htons(port);
     if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) <= 0) { close(sock); return false; }
 
-    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        close(sock);
-        return false;
+    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) { 
+        close(sock); 
+        cerr << "⚠️ Failed to connect to peer " << peer_hp << endl;
+        return false; 
     }
 
     string req = "GET_PIECE " + file_name + " " + to_string(piece_index) + "\n";
-    if (send(sock, req.c_str(), req.size(), 0) != (ssize_t)req.size()) { close(sock); return false; }
+    if (send(sock, req.c_str(), req.size(), 0) != (ssize_t)req.size()) { 
+        cerr << "⚠️ Failed to send request to " << peer_hp << endl;
+        close(sock); 
+        return false; 
+    }
 
     out_buf.clear();
     out_buf.reserve(PIECE_SIZE);
@@ -81,33 +91,50 @@ static bool fetch_piece_from_peer(const string& peer_hp,
         if (total >= PIECE_SIZE) break;
     }
     close(sock);
-    return !out_buf.empty();
+
+    if (out_buf.empty()) {
+        cerr << "⚠️ Peer " << peer_hp << " sent no data for piece " << piece_index << endl;
+        return false;
+    }
+    return true;
 }
 
 static bool allocate_file_space(const string& path, long long size) {
     int fd = open(path.c_str(), O_RDWR | O_CREAT, 0666);
     if (fd < 0) return false;
+#if defined(_POSIX_VERSION)
+    int res = posix_fallocate(fd, 0, (off_t)size);
+    if (res != 0) {
+        if (size > 0) {
+            if (lseek(fd, size - 1, SEEK_SET) < 0) { close(fd); return false; }
+            char zero = 0;
+            if (write(fd, &zero, 1) != 1) { close(fd); return false; }
+        }
+    }
+#else
     if (size > 0) {
         if (lseek(fd, size - 1, SEEK_SET) < 0) { close(fd); return false; }
         char zero = 0;
         if (write(fd, &zero, 1) != 1) { close(fd); return false; }
     }
+#endif
     close(fd);
     return true;
 }
 
-// Worker threads download pieces
+// worker that repeatedly grabs a pending piece and attempts download from peers
 static void piece_worker(const string& key, const vector<string>& peers, int concurrency_limit) {
     while (true) {
         int piece_idx = -1;
         string file_name, dest_path;
 
-        {
+        {   // lock only once here
             lock_guard<mutex> lg(downloads_mutex);
             auto it = downloads.find(key);
             if (it == downloads.end()) return;
             DownloadState &st = it->second;
-            if (st.completed) return;
+            if (st.completed || st.cancelled) return;
+
             for (int i = 0; i < st.piece_count; ++i) {
                 if (!st.done[i] && !st.in_progress_flags[i] && st.in_progress < concurrency_limit) {
                     st.in_progress_flags[i] = true;
@@ -118,8 +145,9 @@ static void piece_worker(const string& key, const vector<string>& peers, int con
                     break;
                 }
             }
+
             if (piece_idx == -1) {
-                bool all_done = all_of(st.done.begin(), st.done.end(), [](bool d){return d;});
+                bool all_done = all_of(st.done.begin(), st.done.end(), [](bool d){ return d; });
                 if (all_done) { st.completed = true; return; }
             }
         }
@@ -130,13 +158,13 @@ static void piece_worker(const string& key, const vector<string>& peers, int con
         }
 
         bool success = false;
-        int peer_count = peers.size();
+        int peer_count = (int)peers.size();
         for (int attempt = 0; attempt < MAX_RETRIES_PER_PIECE && !success; ++attempt) {
-            int peer_idx = peer_count ? attempt % peer_count : -1;
+            int peer_idx = peer_count ? (attempt % peer_count) : -1;
             string peer = (peer_idx >= 0) ? peers[peer_idx] : string();
             vector<char> piece_data;
             if (!peer.empty() && fetch_piece_from_peer(peer, file_name, piece_idx, piece_data)) {
-                string got_hash = sha1_hex(piece_data.data(), piece_data.size()); // from hash_utils
+                string got_hash = sha1_hex(piece_data.data(), piece_data.size());
                 string expected;
                 {
                     lock_guard<mutex> lg(downloads_mutex);
@@ -144,14 +172,18 @@ static void piece_worker(const string& key, const vector<string>& peers, int con
                 }
                 if (got_hash == expected && write_piece_to_file(dest_path, piece_idx, piece_data)) {
                     lock_guard<mutex> lg(downloads_mutex);
-                    downloads[key].done[piece_idx] = true;
-                    downloads[key].pieces_done++;
+                    if (downloads.find(key) != downloads.end()) {
+                        downloads[key].done[piece_idx] = true;
+                        downloads[key].pieces_done++;
+                        downloads[key].piece_owner_idx[piece_idx] =
+                            (downloads[key].piece_owner_idx[piece_idx] + 1) % max(1, peer_count);
+                    }
                     success = true;
                 }
             }
         }
 
-        {
+        {   // mark not in-progress
             lock_guard<mutex> lg(downloads_mutex);
             if (downloads.find(key) != downloads.end()) {
                 downloads[key].in_progress_flags[piece_idx] = false;
@@ -168,7 +200,13 @@ void start_download(const string &group_id,
                     const vector<string> &piece_hashes,
                     const string &file_hash,
                     const vector<string> &peers,
-                    int concurrency) {
+                    int concurrency) 
+{
+    if (peers.empty()) {
+        cout << "ERROR: No peers available for this file\n";
+        return;
+    }
+
     string key = make_key(group_id, file_name);
     {
         lock_guard<mutex> lg(downloads_mutex);
@@ -190,6 +228,7 @@ void start_download(const string &group_id,
         st.pieces_done = 0;
         st.in_progress = 0;
         st.completed = false;
+        st.cancelled = false;
         downloads[key] = move(st);
     }
 
@@ -201,9 +240,9 @@ void start_download(const string &group_id,
     }
 
     for (int i = 0; i < concurrency; ++i) {
-        thread t(piece_worker, key, peers, concurrency);
-        t.detach();
+        thread(piece_worker, key, peers, concurrency).detach();
     }
+    cout << "Started download: " << file_name << " (" << piece_hashes.size() << " pieces) with concurrency " << concurrency << "\n";
 }
 
 void show_downloads() {
@@ -215,7 +254,7 @@ void show_downloads() {
     for (auto &p : downloads) {
         auto &d = p.second;
         double pct = d.piece_count ? (100.0 * d.pieces_done / d.piece_count) : 0.0;
-        cout << (d.completed ? "[C] " : "[ ] ")
+        cout << (d.completed ? "[C] " : d.cancelled ? "[X] " : "[ ] ")
              << "[" << d.group_id << "] " << d.file_name
              << " : " << d.pieces_done << "/" << d.piece_count
              << " (" << (int)pct << "%)\n";
@@ -230,24 +269,29 @@ void stop_download(const string &group_id, const string &file_name) {
         cout << "No such download\n";
         return;
     }
-    downloads.erase(it);
+    it->second.cancelled = true;
     cout << "Stopped download " << file_name << "\n";
 }
 
-// Peer server to handle GET_PIECE requests
+// Peer server: serve GET_PIECE <file_name> <piece_index>\n
 static void handle_peer_connection(int client_fd) {
     string request;
     char buf[1024];
     ssize_t n;
-
     while ((n = read(client_fd, buf, sizeof(buf))) > 0) {
         request.append(buf, n);
         if (request.find('\n') != string::npos) break;
     }
     if (request.empty()) { close(client_fd); return; }
-
     size_t pos = request.find('\n');
     if (pos != string::npos) request = request.substr(0, pos);
+
+    auto trim = [](string s) {
+        size_t start = s.find_first_not_of(" \r\n\t");
+        size_t end   = s.find_last_not_of(" \r\n\t");
+        return (start == string::npos) ? string() : s.substr(start, end - start + 1);
+    };
+    request = trim(request);
 
     istringstream iss(request);
     string cmd, file_name;

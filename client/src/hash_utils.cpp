@@ -45,9 +45,20 @@ string preprocess_upload_file(const string& input) {
 
     // compute full file hash
     ifstream in2(file_path, ios::binary);
-    vector<char> allbuf(total_size);
-    in2.read(allbuf.data(), total_size);
-    string full_hash = sha1_hex(allbuf.data(), total_size);
+    SHA_CTX ctx;
+    SHA1_Init(&ctx);
+    vector<char> buf2(PIECE_SIZE);
+    while (in2) {
+        in2.read(buf2.data(), PIECE_SIZE);
+        streamsize n = in2.gcount();
+        if (n > 0) SHA1_Update(&ctx, buf2.data(), n);
+    }
+    unsigned char final_hash[SHA_DIGEST_LENGTH];
+    SHA1_Final(final_hash, &ctx);
+    char fullbuf[41];
+    for (int i = 0; i < 20; i++) sprintf(fullbuf + i*2, "%02x", final_hash[i]);
+    fullbuf[40] = '\0';
+    string full_hash(fullbuf);
     in2.close();
 
     // build expanded command
@@ -55,5 +66,10 @@ string preprocess_upload_file(const string& input) {
     oss << "upload_file " << group_id << " " << file_path << " " << total_size;
     for (auto &h : piece_hashes) oss << " " << h;
     oss << " " << full_hash;
+    system("mkdir -p ./shared");
+    string dest = "./shared/" + file_path.substr(file_path.find_last_of("/\\") + 1);
+    ifstream src(file_path, ios::binary);
+    ofstream dst(dest, ios::binary);
+    dst << src.rdbuf();
     return oss.str();
 }
