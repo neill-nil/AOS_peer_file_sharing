@@ -49,19 +49,15 @@ int connect_to_tracker(const string& client_ip, int client_port,
     int opt = 1;
     setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    struct sockaddr_in local{};
-    local.sin_family = AF_INET;
-    local.sin_port = htons(client_port);
-    inet_pton(AF_INET, client_ip.c_str(), &local.sin_addr);
-    if (bind(sock, (struct sockaddr*)&local, sizeof(local)) < 0) {
-        close(sock);
-        return -1;
-    }
+    // ❌ remove forced bind for client tracker connections
 
     struct sockaddr_in serv_addr{};
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_port = htons(tracker_port);
-    inet_pton(AF_INET, tracker_ip.c_str(), &serv_addr.sin_addr);
+    if (inet_pton(AF_INET, tracker_ip.c_str(), &serv_addr.sin_addr) <= 0) {
+        close(sock);
+        return -1;
+    }
 
     if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
         close(sock);
@@ -71,12 +67,11 @@ int connect_to_tracker(const string& client_ip, int client_port,
     return sock;
 }
 
-// helper: read available data from socket with small timeout to avoid blocking forever
+// helper: read available data from socket with small timeout
 static string read_available_with_timeout(int sock, int max_iterations = 80, int sleep_us = 25000) {
     string resp;
     char buf[2048];
 
-    // save flags and set non-blocking
     int flags = fcntl(sock, F_GETFL, 0);
     if (flags >= 0) fcntl(sock, F_SETFL, flags | O_NONBLOCK);
 
@@ -84,30 +79,22 @@ static string read_available_with_timeout(int sock, int max_iterations = 80, int
         ssize_t n = read(sock, buf, sizeof(buf));
         if (n > 0) {
             resp.append(buf, n);
-            // keep reading in case the tracker sent multi-line response
-            // small optimization: if we've seen two newlines in a row, stop early
             if (resp.find("\n\n") != string::npos) break;
-            // otherwise continue looping to gather more data
             usleep(2000);
             continue;
         } else if (n == 0) {
-            // peer closed socket
             break;
         } else {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // no data right now; wait a bit and retry
                 usleep(sleep_us);
                 continue;
             } else {
-                // real error
                 break;
             }
         }
     }
 
-    // restore flags
     if (flags >= 0) fcntl(sock, F_SETFL, flags);
-
     return resp;
 }
 
@@ -140,15 +127,19 @@ int main(int argc, char* argv[]) {
     int active = -1;
     int tracker_sock = -1;
 
-    // Initial connection
+    // Initial connection: try ALL trackers before failing
     for (int i = 0; i < (int)trackers.size(); ++i) {
-        tracker_sock = connect_to_tracker(client_ip, client_port,
-                                          trackers[i].first, trackers[i].second);
-        if (tracker_sock >= 0) {
+        int sock = connect_to_tracker(client_ip, client_port,
+                                      trackers[i].first, trackers[i].second);
+        if (sock >= 0) {
+            tracker_sock = sock;
             active = i;
             cout << "✅ Connected to tracker at "
                  << trackers[i].first << ":" << trackers[i].second << endl;
             break;
+        } else {
+            cerr << "⚠️ Could not connect to tracker at "
+                 << trackers[i].first << ":" << trackers[i].second << " (trying next)\n";
         }
     }
 
@@ -186,10 +177,7 @@ int main(int argc, char* argv[]) {
                 break;
             }
 
-            // read available response with timeout (non-blocking spinner)
             string response = read_available_with_timeout(tracker_sock);
-
-            // DEBUG: print raw tracker response for get_file_info
             cout << "[DEBUG get_file_info raw]:\n" << response << endl;
 
             if (response.empty()) {
@@ -197,7 +185,6 @@ int main(int argc, char* argv[]) {
                 continue;
             }
 
-            // Trim leading whitespace for checks
             auto ltrim = [](string &s) {
                 size_t a = 0;
                 while (a < s.size() && isspace((unsigned char)s[a])) ++a;
@@ -208,14 +195,10 @@ int main(int argc, char* argv[]) {
             if (response.rfind("ERROR", 0) == 0) {
                 cout << response;
             } else if (response.rfind("FILE_INFO", 0) == 0 || response.rfind("OK", 0) == 0) {
-                // some trackers may send FILE_INFO header; adjust to parse both
-                // We will parse lines robustly
                 istringstream resp(response);
                 string first;
                 resp >> first;
 
-                // If tracker used "OK" format, parse accordingly.
-                // We'll attempt to detect both formats.
                 long long file_size = 0;
                 string file_hash;
                 int piece_count = 0;
@@ -223,7 +206,6 @@ int main(int argc, char* argv[]) {
                 vector<string> peers;
 
                 if (first == "FILE_INFO") {
-                    // FILE_INFO <group> <file>
                     string group, fname;
                     resp >> group >> fname;
                     string line;
@@ -244,9 +226,6 @@ int main(int argc, char* argv[]) {
                         }
                     }
                 } else {
-                    // Assume OK <size> <file_hash> <piece_count> <piece_hashes...> peers: <peer list...>
-                    // We'll parse tokens
-                    // Reset stream
                     resp.clear();
                     resp.seekg(0);
                     string token;
@@ -257,14 +236,12 @@ int main(int argc, char* argv[]) {
                         resp >> ph;
                         piece_hashes.push_back(ph);
                     }
-                    // next token should be "peers:" (maybe)
                     string tag;
                     resp >> tag;
                     if (tag == "peers:" || tag == "peers") {
                         string peer;
                         while (resp >> peer) peers.push_back(peer);
                     } else {
-                        // no peers tag: try to read remaining tokens as peers
                         if (!tag.empty()) peers.push_back(tag);
                         string peer;
                         while (resp >> peer) peers.push_back(peer);
@@ -292,14 +269,39 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
-        // Send other commands
-        command.push_back('\n');  // ensure newline terminated
-        if (send(tracker_sock, command.c_str(), command.size(), 0) < 0) {
-            cout << "⚠️ Tracker connection lost\n";
+        // Send other commands, with failover if tracker dies
+        command.push_back('\n');
+        bool sent = false;
+        int attempts = 0;
+
+        while (!sent && attempts < (int)trackers.size()) {
+            if (send(tracker_sock, command.c_str(), command.size(), 0) < 0) {
+                cout << "⚠️ Tracker connection lost, trying next...\n";
+                close(tracker_sock);
+
+                active = (active + 1) % trackers.size();
+                tracker_sock = connect_to_tracker(client_ip, client_port,
+                                                  trackers[active].first, trackers[active].second);
+                if (tracker_sock < 0) {
+                    attempts++;
+                    continue;
+                } else {
+                    cout << "✅ Reconnected to tracker at "
+                         << trackers[active].first << ":" << trackers[active].second << endl;
+                    if (send(tracker_sock, command.c_str(), command.size(), 0) >= 0) {
+                        sent = true;
+                    }
+                }
+            } else {
+                sent = true;
+            }
+        }
+
+        if (!sent) {
+            cerr << "❌ All trackers unreachable\n";
             break;
         }
 
-        // read server reply (simple read with small timeout)
         string reply = read_available_with_timeout(tracker_sock);
         if (!reply.empty()) {
             cout << reply;
