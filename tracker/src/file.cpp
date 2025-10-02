@@ -5,12 +5,13 @@
 #include <bits/stdc++.h>
 #include <iostream>
 
-
 using namespace std;
 
-
+// actual definition of shared_files (header declares it extern)
 unordered_map<string, unordered_map<string, FileInfo>> shared_files;
-extern unordered_map<string, string> user_peer_addresses; 
+
+
+
 
 string upload_file(const string& group_id, const string& user,
                    const string& file_name, long long file_size,
@@ -31,18 +32,13 @@ string upload_file(const string& group_id, const string& user,
     f.piece_hashes = piece_hashes;
     f.file_hash = file_hash;
 
-    // ✅ store peer address instead of username
-    string peer_addr = user_peer_addresses[user];
-    if (peer_addr.empty()) {
-        return "ERROR: No peer address registered for user\n";
-    }
-    f.peers.insert(peer_addr);
+    // store the username as seeder (not the ip:port)
+    f.seeders.insert(user);
 
-    // ✅ sync everything (size, hash, piece count, peer addr)
-    string log = "UPLOAD_FILE " + group_id + " " + file_name + " " + to_string(file_size) +
-                 " " + file_hash + " " + to_string(piece_hashes.size());
+    // UPLOAD_FILE <group> <file> <user> <file_size> <file_hash> <piece_count> <piece_hash1> <piece_hash2> ...
+    string log = "UPLOAD_FILE " + group_id + " " + file_name + " " + user + " " +
+                 to_string(file_size) + " " + file_hash + " " + to_string(piece_hashes.size());
     for (auto &h : piece_hashes) log += " " + h;
-    log += " " + peer_addr;
     sync_write(log);
 
     return "File uploaded successfully\n";
@@ -71,15 +67,29 @@ string stop_share(const string& group_id, const string& user, const string& file
         return "ERROR: File not found\n";
     }
 
-    string peer_addr = user_peer_addresses[user];
-    shared_files[group_id][file_name].peers.erase(peer_addr);
-    if (shared_files[group_id][file_name].peers.empty()) {
+    shared_files[group_id][file_name].seeders.erase(user);
+
+    auto &vec = user_seed_history[user]; 
+    vec.erase(
+        remove_if(vec.begin(), vec.end(),
+                  [&](const pair<string,string>& entry) {
+                      return entry.first == group_id && entry.second == file_name;
+                  }),
+        vec.end()
+    );
+
+    if (vec.empty()) {
+        user_seed_history.erase(user);
+    }
+
+    if (shared_files[group_id][file_name].seeders.empty()) {
         shared_files[group_id].erase(file_name);
     }
-    sync_write("STOP_SHARE " + group_id + " " + file_name + " " + peer_addr);
 
+    sync_write("STOP_SHARE " + group_id + " " + file_name + " " + user);
     return "Stopped sharing " + file_name + "\n";
 }
+
 
 string get_file_info(const string& group_id, const string& file_name, const string& user) {
     if (groups.find(group_id) == groups.end()) {
@@ -93,12 +103,35 @@ string get_file_info(const string& group_id, const string& file_name, const stri
     }
 
     const FileInfo &f = shared_files[group_id].at(file_name);
+
+    // Build response in the OK format your client expects:
     ostringstream oss;
     oss << "OK " << f.file_size << " " << f.file_hash << " " << f.piece_hashes.size();
     for (auto &h : f.piece_hashes) oss << " " << h;
+
     oss << " peers:";
-    for (auto &p : f.peers) oss << " " << p;
+    // convert seeder usernames -> ip:port using user_peer_addresses map
+    for (auto &username : f.seeders) {
+        auto it = user_peer_addresses.find(username);
+        if (it != user_peer_addresses.end() && !it->second.empty()) {
+            oss << " " << it->second;
+        }
+    }
     oss << "\n";
     return oss.str();
 }
 
+string announce_seeder(const string& group_id, const string& user, const string& file_name) {
+    if (!group_members[group_id].count(user)) {
+        return "ERROR: Must be group member to seed file\n";
+    }
+    if (shared_files[group_id].find(file_name) == shared_files[group_id].end()) {
+        return "ERROR: File not found in group\n";
+    }
+
+    shared_files[group_id][file_name].seeders.insert(user);
+
+    sync_write("ANNOUNCE_SEEDER " + group_id + " " + file_name + " " + user);
+
+    return "Seeder added for " + file_name + "\n";
+}

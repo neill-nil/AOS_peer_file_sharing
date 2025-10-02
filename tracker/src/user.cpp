@@ -1,4 +1,5 @@
 #include "utils.hpp"
+#include "file.hpp"
 #include "sync.hpp"
 #include <iostream>
 #include <bits/stdc++.h>
@@ -11,6 +12,7 @@ unordered_map<string, string> groups; // group_id -> owner
 unordered_map<string, unordered_set<string>> group_members; // group_id -> members
 unordered_map<string, unordered_set<string>> join_requests; // group_id -> pending requests
 unordered_map<string, string> user_peer_addresses; // username -> ip:port
+unordered_map<string, vector<pair<string,string>>> user_seed_history;
 
 
 // USERS
@@ -24,27 +26,40 @@ string create_user(const string& username, const string& password) {
     return "User created successfully\n";
 }
 
-string login_user(const string& username, const string& password, string& current_user, const string& peer_addr) {
-    // Prevent double login on same client session
-    cout << "[DEBUG] login_user: before -> current_user='" << current_user << "'" << endl;
-    if (!current_user.empty()) {
-        return "ERROR: Already logged in as " + current_user + " (logout first)\n";
-    }
+string login_user(string& current_user, const string& username, const string& password, const string& peer_addr) {
+    cerr << "[DEBUG] login_user called for username=" << username 
+         << " password=" << password << endl;
 
-    auto it = users.find(username);
-    if (it == users.end() || it->second != password) {
+    if (!users.count(username)) {
+        cerr << "[DEBUG] user not found in users map" << endl;
+    } else {
+        cerr << "[DEBUG] stored password=" << users[username] << endl;
+    }
+    if (!users.count(username) || users[username] != password) {
         return "ERROR: Invalid credentials\n";
     }
     if (logged_in[username]) {
-        return "ERROR: User already logged in elsewhere\n";
+        return "ERROR: User already logged in somewhere else\n";
     }
 
     logged_in[username] = true;
     user_peer_addresses[username] = peer_addr;
     current_user = username;
-    cout << "[DEBUG] login_user: before -> current_user='" << current_user << "'" << endl;
-    sync_write("LOGIN " + username);
 
+    //Restore seeding from history
+    if (user_seed_history.count(username)) {
+        for (auto &entry : user_seed_history[username]) {
+            string group_id = entry.first;
+            string file_name = entry.second;
+
+            if (shared_files.count(group_id) && shared_files[group_id].count(file_name)) {
+                shared_files[group_id][file_name].seeders.insert(username);
+                sync_write("ANNOUNCE_SEEDER " + group_id + " " + file_name + " " + username);
+            }
+        }
+    }
+
+    sync_write("LOGIN " + username);
     return "Login successful as " + username + "\n";
 }
 
@@ -54,8 +69,19 @@ string logout_user(string& current_user) {
         return "ERROR: No user logged in\n";
     }
 
-    // Always log them out in session and global state
     logged_in[current_user] = false;
+
+    // Save seeding history before removing
+    user_seed_history[current_user].clear();
+    for (auto &grp : shared_files) {
+        for (auto &fpair : grp.second) {
+            if (fpair.second.seeders.count(current_user)) {
+                user_seed_history[current_user].push_back({grp.first, fpair.first});
+                fpair.second.seeders.erase(current_user);
+            }
+        }
+    }
+
     sync_write("LOGOUT " + current_user);
 
     string old_user = current_user;

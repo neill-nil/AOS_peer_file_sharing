@@ -49,7 +49,7 @@ int connect_to_tracker(const string& client_ip, int client_port,
     int opt = 1;
     setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    // ❌ remove forced bind for client tracker connections
+    // no forced bind
 
     struct sockaddr_in serv_addr{};
     serv_addr.sin_family = AF_INET;
@@ -65,6 +65,18 @@ int connect_to_tracker(const string& client_ip, int client_port,
     }
 
     return sock;
+}
+
+int tracker_sock = -1;
+
+// Called by download_manager when a file completes
+void notify_download_complete(const string &group, const string &file) {
+    cout << "✅ Download complete: " << file << " (becoming seeder)\n";
+
+    string cmd = "announce_seeder " + group + " " + file + "\n";
+    if (send(tracker_sock, cmd.c_str(), cmd.size(), 0) < 0) {
+        cerr << "⚠️ Failed to notify tracker about new seeder\n";
+    }
 }
 
 // helper: read available data from socket with small timeout
@@ -121,18 +133,17 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // start peer server for piece uploads
+    // start peer server
     start_peer_server(client_ip, client_port);
 
     int active = -1;
-    int tracker_sock = -1;
 
     // Initial connection: try ALL trackers before failing
     for (int i = 0; i < (int)trackers.size(); ++i) {
         int sock = connect_to_tracker(client_ip, client_port,
                                       trackers[i].first, trackers[i].second);
         if (sock >= 0) {
-            tracker_sock = sock;
+            tracker_sock = sock; 
             active = i;
             cout << "✅ Connected to tracker at "
                  << trackers[i].first << ":" << trackers[i].second << endl;

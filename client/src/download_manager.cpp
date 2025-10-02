@@ -25,6 +25,8 @@ mutex downloads_mutex;
 static const size_t PIECE_SIZE = 512 * 1024; // 512KB
 static const int MAX_RETRIES_PER_PIECE = 4;
 
+extern void notify_download_complete(const std::string &group, const std::string &file);
+
 static string make_key(const string& group, const string& file) {
     return group + ":" + file;
 }
@@ -148,7 +150,15 @@ static void piece_worker(const string& key, const vector<string>& peers, int con
 
             if (piece_idx == -1) {
                 bool all_done = all_of(st.done.begin(), st.done.end(), [](bool d){ return d; });
-                if (all_done) { st.completed = true; return; }
+                if (all_done) {
+                    st.completed = true;
+
+                    // Notify client that this file is now fully downloaded
+                    extern void notify_download_complete(const string &group, const string &file);
+                    notify_download_complete(st.group_id, st.file_name);
+
+                    return;
+                }
             }
         }
 

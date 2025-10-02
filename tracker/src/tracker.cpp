@@ -35,10 +35,10 @@ string handle_command(const string& command, string& current_user) {
     else if (cmd == "login") {
         string username, password, peer_addr;
         iss >> username >> password >> peer_addr;
-        return login_user(username, password, current_user, peer_addr);
+        return login_user(current_user, username, password, peer_addr);
     }
     else if (cmd == "logout") {
-        return logout_user(current_user); // this should also clear current_user
+        return logout_user(current_user); 
     }
     else if (cmd == "create_group") {
         string group_id;
@@ -101,6 +101,11 @@ string handle_command(const string& command, string& current_user) {
 
         return upload_file(group_id, current_user, file_name, file_size, piece_hashes, file_hash);
     }
+    else if (cmd == "announce_seeder") {
+        string group_id, file_name, username;
+        iss >> group_id >> file_name >> username;
+        return announce_seeder(group_id, username, file_name);
+    }
     else if (cmd == "stop_share") {
         string group_id, file_name;
         iss >> group_id >> file_name;
@@ -149,7 +154,6 @@ void handle_peer_request(int client_socket) {
 
     close(client_socket);
 }
-//
 
 
 void tracker_loop(int server_fd, bool &running) {
